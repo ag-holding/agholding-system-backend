@@ -11,8 +11,9 @@ const db = knex({
     ssl: { rejectUnauthorized: false },  // uncomment for cloud providers
   },
   pool: {
-    min: 2,
-    max: 10,
+    min: 0,
+    max: 5,
+    acquireTimeoutMillis: 30000,
   },
 });
 

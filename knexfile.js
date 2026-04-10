@@ -48,7 +48,7 @@ module.exports = {
     migrations: {
       directory: './src/migrations',
     },
-    pool: { min: 2, max: 20 },
+    pool: { min: 0, max: 10, acquireTimeoutMillis: 30000 },
   },
 
   testClientDatabaseConnection,
