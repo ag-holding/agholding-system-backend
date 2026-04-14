@@ -14,6 +14,22 @@ const { db } = require('../config/database');
 const { listClientTables } = require('../services/getdata.services');
 const logger = require('../utils/logger');
 
+// ─── Virtual report module IDs ────────────────────────────────────────────────
+// These are not DB tables — they are virtual module names that appear in the
+// role creation module list alongside real table names.
+// Must stay in sync with reports.routes.js requireModuleAccess() calls
+// and with REPORT_MODULES in the frontend.
+const REPORT_VIRTUAL_MODULES = [
+  'report_general_ledger',
+  'report_trial_balance',
+  'report_income_statement',
+  'report_balance_sheet',
+  'report_inventory',
+  'report_vat_report',
+  'report_ap_aging',
+  'report_ar_aging',
+];
+
 // ─── Subsidiaries ────────────────────────────────────────────────────────────
 
 exports.getSubsidiaries = async (req, res, next) => {
@@ -23,12 +39,21 @@ exports.getSubsidiaries = async (req, res, next) => {
   } catch (error) { next(error); }
 };
 
-// ─── Modules ─────────────────────────────────────────────────────────────────
+// ─── Modules (tables + virtual report modules) ───────────────────────────────
 
+/**
+ * GET /database/users/modules
+ *
+ * Returns all DB table names PLUS the virtual report module IDs.
+ * Both kinds appear in the role creation module checklist.
+ * Admin only.
+ */
 exports.getModules = async (req, res, next) => {
   try {
-    const modules = await listClientTables(null);
-    res.json({ success: true, modules });
+    const tables = await listClientTables(null);
+    // Append report virtual modules at the end so they appear separately
+    const allModules = [...tables, ...REPORT_VIRTUAL_MODULES];
+    res.json({ success: true, modules: allModules });
   } catch (error) { next(error); }
 };
 
@@ -51,26 +76,16 @@ exports.getUser = async (req, res, next) => {
 
 // ─── Invitation ──────────────────────────────────────────────────────────────
 
-/**
- * POST /database/users/invite
- * Body: { email, roleId }
- *
- * Simplified: only email + roleId. Subsidiary/module access
- * inherited automatically from the role.
- */
 exports.inviteUser = async (req, res, next) => {
   try {
     const { email, roleId } = req.body;
-
     if (!email) return res.status(400).json({ success: false, error: 'email is required' });
     if (!roleId) return res.status(400).json({ success: false, error: 'roleId is required' });
-
     const result = await inviteUser({
       email,
       roleId: parseInt(roleId, 10),
       invitedBy: req.user.userId,
     });
-
     res.status(200).json({ success: true, ...result });
   } catch (error) {
     if (error.statusCode) return res.status(error.statusCode).json({ success: false, error: error.message });
@@ -99,50 +114,30 @@ exports.verifyInviteToken = async (req, res, next) => {
   try {
     const { token } = req.query;
     if (!token) return res.status(400).json({ success: false, error: 'token is required' });
-
     const invite = await db('invitation_tokens')
-      .where({ token, used: false })
-      .where('expires_at', '>', new Date())
-      .first();
-
+      .where({ token, used: false }).where('expires_at', '>', new Date()).first();
     if (!invite) {
       return res.status(400).json({ success: false, valid: false, error: 'Invalid or expired token' });
     }
-
-    // Fetch role details to show on accept page
     let roleDetails = null;
     if (invite.role_id) {
       const role = await db('app_roles').where({ id: invite.role_id }).first();
       if (role) roleDetails = { id: role.id, name: role.name };
     }
-
-    res.json({
-      success: true,
-      valid: true,
-      email: invite.email,
-      role: invite.role,
-      roleDetails,
-    });
+    res.json({ success: true, valid: true, email: invite.email, role: invite.role, roleDetails });
   } catch (error) { next(error); }
 };
 
-// ─── Role Assignment (replaces per-user permission editing) ─────────────────
+// ─── Role assignment ─────────────────────────────────────────────────────────
 
-/**
- * PUT /database/users/:id/role
- * Body: { roleId }
- * Admin assigns a different role to a user.
- */
 exports.updateUserRole = async (req, res, next) => {
   try {
     const userId = parseInt(req.params.id, 10);
     const { roleId } = req.body;
-
     if (!roleId) return res.status(400).json({ success: false, error: 'roleId is required' });
     if (req.user.userId === userId) {
       return res.status(400).json({ success: false, error: 'You cannot change your own role' });
     }
-
     const result = await updateUserRole(userId, { roleId: parseInt(roleId, 10) });
     res.json(result);
   } catch (error) {

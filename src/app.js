@@ -10,6 +10,7 @@ const netsuiteRoutes = require('./routes/netsuite.routes');
 const fileUploadRoutes = require('./routes/fileUpload.routes');
 const apiKeyMiddleware = require('./middlewares/apiKey.middleware');
 const errorMiddleware = require('./middlewares/error.middleware');
+const roleRoutes = require('./routes/role.routes');        // ← ADD THIS
 
 const app = express();
 
@@ -28,6 +29,8 @@ app.use('/api/database/users', userRoutes);
 app.use('/api/reports', reportsRoutes);                // ← Reports
 app.use('/api/netsuite', apiKeyMiddleware, netsuiteRoutes);
 app.use('/api/files', fileUploadRoutes);
+app.use('/api/database/roles', roleRoutes);       // ← ADD THIS
+
 
 app.get('/health', (req, res) => res.json({ status: 'OK', timestamp: new Date() }));
 app.use(errorMiddleware);
