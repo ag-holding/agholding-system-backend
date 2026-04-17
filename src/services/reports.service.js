@@ -203,29 +203,65 @@ async function getIncomeStatement({ fromPeriod, toPeriod, subsidiaries = [] }) {
   const subFilter = buildSubsidiaryBindings(subsidiaries);
   const subClause = subFilter ? `AND ${subFilter.clause}` : '';
 
-  // Uses accounttype to classify Income / Expense lines
   const sql = `
-    SELECT
-      accounttype,
-      accounttext                                                         AS account,
-      SUM(COALESCE(NULLIF(TRIM(netamount::text),'')::numeric, 0))          AS net_amount
-    FROM "GLImpact_table"
-    WHERE LOWER(TRIM(isposting)) IN (${placeholders})
-      AND LOWER(accounttype) IN ('income','other income','cost of goods sold','expense','other expense')
-      AND accounttext IS NOT NULL
-      AND LOWER(TRIM("recordtype")) NOT IN ('currency revaluation', 'deliver note')
-      ${subClause}
-    GROUP BY accounttype, accounttext
+    WITH detail_data AS (
+      SELECT
+        g.internalid,
+        g.accounttext AS account,
+        g.accounttype AS account_type,
+        MIN(g.recordtype) AS recordtype,
+        CASE
+          WHEN g.accounttype IN ('Income','Other Income') THEN 'Income'
+          WHEN g.accounttype IN ('Cost of Goods Sold') THEN 'COGS'
+          WHEN g.accounttype IN ('Expense','Other Expense') THEN 'Expenses'
+        END AS category,
+        SUM(COALESCE(NULLIF(TRIM(g.drfxamount), '')::numeric, 0)) AS dr,
+        SUM(COALESCE(NULLIF(TRIM(g.crfxamount), '')::numeric, 0)) AS cr
+      FROM "GLImpact_table" g
+      WHERE LOWER(TRIM(g.isposting)) IN (${placeholders})
+        AND g.accounttext IS NOT NULL
+        AND TRIM(g.accounttext) <> ''
+        AND LOWER(TRIM(g.recordtype)) NOT IN ('currency revaluation', 'delivery note')
+        AND g.accounttype IN (
+          'Income','Other Income',
+          'Cost of Goods Sold',
+          'Expense','Other Expense'
+        )
+        ${subClause}
+      GROUP BY g.internalid, g.accounttext, g.accounttype
+    ),
+    pl_data AS (
+      SELECT
+        internalid, recordtype, category, account, account_type,
+        CASE
+          WHEN category = 'Income' THEN cr - dr
+          WHEN category = 'COGS' THEN dr - cr
+          WHEN category = 'Expenses' THEN dr - cr
+        END AS amount
+      FROM detail_data
+    ),
+    final AS (
+      SELECT internalid, recordtype, category, account, account_type, amount, 1 AS sort_order
+      FROM pl_data
+      UNION ALL
+      SELECT NULL, NULL, category, 'Total ' || category, NULL, ABS(SUM(amount)), 2
+      FROM pl_data
+      GROUP BY category
+      UNION ALL
+      SELECT NULL, NULL, 'Net', 'Net Income', NULL, SUM(amount), 3
+      FROM pl_data
+    )
+    SELECT internalid, recordtype, category, account, account_type, amount
+    FROM final
     ORDER BY
-      CASE LOWER(accounttype)
-        WHEN 'income'        THEN 1
-        WHEN 'other income'  THEN 2
-        WHEN 'cost of goods sold' THEN 3
-        WHEN 'expense'       THEN 4
-        WHEN 'other expense' THEN 5
-        ELSE 6
+      CASE category
+        WHEN 'Income' THEN 1
+        WHEN 'COGS' THEN 2
+        WHEN 'Expenses' THEN 3
+        WHEN 'Net' THEN 4
       END,
-      accounttext
+      sort_order,
+      account
   `;
 
   const bindings = subFilter ? [...periods, ...subFilter.bindings] : periods;
