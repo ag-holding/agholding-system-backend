@@ -246,35 +246,82 @@ async function getBalanceSheet({ fromPeriod, toPeriod, subsidiaries = [] }) {
   const subClause = subFilter ? `AND ${subFilter.clause}` : '';
 
   const sql = `
-    SELECT
-      accounttype,
-      accounttext                                                         AS account,
-      SUM(COALESCE(NULLIF(TRIM(endingbalance::text),'')::numeric, 0))      AS ending_balance
-    FROM "GLImpact_table"
-    WHERE LOWER(TRIM(isposting)) IN (${placeholders})
-      AND LOWER(accounttype) IN ('bank','accounts receivable','other current asset','fixed asset',
-                                 'other asset','accounts payable','credit card','other current liability',
-                                 'long term liability','equity','retained earnings')
-      AND accounttext IS NOT NULL
-      AND LOWER(TRIM("recordtype")) NOT IN ('currency revaluation', 'deliver note')
-      ${subClause}
-    GROUP BY accounttype, accounttext
+    WITH detail_data AS (
+      SELECT
+        g.internalid,
+        g.accounttext AS account,
+        g.accounttype AS account_type,
+        MIN(g.recordtype) AS recordtype,
+        CASE
+          WHEN g.accounttype IN (
+            'Bank','Accounts Receivable','Other Current Asset',
+            'Fixed Asset','Other Asset'
+          ) THEN 'Assets'
+          WHEN g.accounttype IN (
+            'Accounts Payable','Credit Card',
+            'Other Current Liability','Long Term Liability'
+          ) THEN 'Liabilities'
+          WHEN g.accounttype = 'Equity' THEN 'Equity'
+        END AS category,
+        SUM(COALESCE(NULLIF(TRIM(g.drfxamount), '')::numeric, 0)) AS dr,
+        SUM(COALESCE(NULLIF(TRIM(g.crfxamount), '')::numeric, 0)) AS cr
+      FROM "GLImpact_table" g
+      WHERE LOWER(TRIM(g.isposting)) IN (${placeholders})
+        AND g.accounttext IS NOT NULL
+        AND TRIM(g.accounttext) <> ''
+        AND LOWER(TRIM(g.recordtype)) NOT IN ('currency revaluation', 'delivery note')
+        AND g.accounttype IN (
+          'Bank','Accounts Receivable','Other Current Asset',
+          'Fixed Asset','Other Asset',
+          'Accounts Payable','Credit Card',
+          'Other Current Liability','Long Term Liability',
+          'Equity'
+        )
+        ${subClause}
+      GROUP BY g.internalid, g.accounttext, g.accounttype
+    ),
+    non_equity AS (
+      SELECT
+        internalid, recordtype, category, account, account_type,
+        CASE
+          WHEN category = 'Assets' THEN dr - cr
+          ELSE cr - dr
+        END AS amount
+      FROM detail_data
+      WHERE category <> 'Equity'
+    ),
+    equity_split AS (
+      SELECT internalid, recordtype, category, account, account_type, -dr AS amount
+      FROM detail_data
+      WHERE category = 'Equity' AND dr <> 0
+      UNION ALL
+      SELECT internalid, recordtype, category, account, account_type, cr AS amount
+      FROM detail_data
+      WHERE category = 'Equity' AND cr <> 0
+    ),
+    all_data AS (
+      SELECT * FROM non_equity
+      UNION ALL
+      SELECT * FROM equity_split
+    ),
+    final AS (
+      SELECT internalid, recordtype, category, account, account_type, amount, 1 AS sort_order
+      FROM all_data
+      UNION ALL
+      SELECT NULL, NULL, category, 'Total ' || category, NULL, ABS(SUM(amount)), 2
+      FROM all_data
+      GROUP BY category
+    )
+    SELECT internalid, recordtype, category, account, account_type, amount
+    FROM final
     ORDER BY
-      CASE LOWER(accounttype)
-        WHEN 'bank'                     THEN 1
-        WHEN 'accounts receivable'      THEN 2
-        WHEN 'other current asset'      THEN 3
-        WHEN 'fixed asset'              THEN 4
-        WHEN 'other asset'              THEN 5
-        WHEN 'accounts payable'         THEN 6
-        WHEN 'credit card'              THEN 7
-        WHEN 'other current liability'  THEN 8
-        WHEN 'long term liability'      THEN 9
-        WHEN 'equity'                   THEN 10
-        WHEN 'retained earnings'        THEN 11
-        ELSE 12
+      CASE category
+        WHEN 'Assets' THEN 1
+        WHEN 'Liabilities' THEN 2
+        WHEN 'Equity' THEN 3
       END,
-      accounttext
+      sort_order,
+      account
   `;
 
   const bindings = subFilter ? [...periods, ...subFilter.bindings] : periods;
