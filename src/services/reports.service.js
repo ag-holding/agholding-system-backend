@@ -473,38 +473,163 @@ async function getAPAging({ fromPeriod, toPeriod, subsidiaries = [] }) {
 // 8. ACCOUNTS RECEIVABLE AGING
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Build period strings in "mon yyyy" format (e.g. "oct 2022") for transaction tables
+ * whose Postingperiod column uses that format instead of "mon-yy".
+ */
+function buildTransactionPeriods(fromPeriod, toPeriod) {
+  const from = parsePeriod(fromPeriod);
+  const to   = parsePeriod(toPeriod);
+  if (!from || !to) return [];
+
+  const result = [];
+  let { month, year } = from;
+  while (year < to.year || (year === to.year && month <= to.month)) {
+    const m = Object.keys(MONTH_ORDER).find(k => MONTH_ORDER[k] === month);
+    result.push(`${m} ${year}`);
+    month++;
+    if (month > 12) { month = 1; year++; }
+  }
+  return result;
+}
+
 async function getARAging({ fromPeriod, toPeriod, subsidiaries = [] }) {
-  const periods = buildPeriodRange(fromPeriod, toPeriod);
+  const periods = buildTransactionPeriods(fromPeriod, toPeriod);
   if (periods.length === 0) throw Object.assign(new Error('Invalid period range'), { statusCode: 400 });
 
   const placeholders = periods.map(() => '?').join(',');
-  const subFilter = buildSubsidiaryBindings(subsidiaries);
-  const subClause = subFilter ? `AND ${subFilter.clause}` : '';
+
+  // Transaction tables use "subsidiary" column, not "glsubsidiarytext"
+  let subClause = '';
+  let subBindings = [];
+  if (subsidiaries && subsidiaries.length > 0) {
+    const normalized = subsidiaries.map(s => s.trim().toLowerCase());
+    const subPlaceholders = normalized.map(() => '?').join(',');
+    subClause = `AND LOWER(TRIM(subsidiary)) IN (${subPlaceholders})`;
+    subBindings = normalized;
+  }
+
+  // Each source table needs its own copy of period + subsidiary bindings
+  const singleBindings = [...periods, ...subBindings];
+  const bindings = [
+    ...singleBindings, // invoice
+    ...singleBindings, // creditmemo
+    ...singleBindings, // customerpayment
+    ...singleBindings, // check
+    ...singleBindings, // deposit
+  ];
 
   const sql = `
+    WITH trx AS (
+      -- Invoice (positive balance)
+      SELECT
+        i.internalid,
+        'Invoice' AS recordtype,
+        i.tranid,
+        i.trandate,
+        i.duedate,
+        COALESCE(NULLIF(TRIM(i.name), ''), 'No Customer/Project') AS customer_name,
+        COALESCE(NULLIF(TRIM(i.total), '')::numeric, 0) AS open_balance
+      FROM invoice i
+      WHERE LOWER(TRIM(i."postingperiod")) IN (${placeholders})
+        ${subClause}
+
+      UNION ALL
+
+      -- Credit Memo (negative balance)
+      SELECT
+        cm.internalid,
+        'Credit Memo' AS recordtype,
+        cm.tranid,
+        cm.trandate,
+        cm.trandate AS duedate,
+        COALESCE(NULLIF(TRIM(cm.name), ''), 'No Customer/Project') AS customer_name,
+        -COALESCE(NULLIF(TRIM(cm.total), '')::numeric, 0) AS open_balance
+      FROM creditmemo cm
+      WHERE LOWER(TRIM(cm."postingperiod")) IN (${placeholders})
+        ${subClause}
+
+      UNION ALL
+
+      -- Customer Payment (negative balance)
+      SELECT
+        cp.internalid,
+        'Payment' AS recordtype,
+        cp.tranid,
+        cp.trandate,
+        cp.trandate AS duedate,
+        COALESCE(NULLIF(TRIM(cp.name), ''), 'No Customer/Project') AS customer_name,
+        -COALESCE(NULLIF(TRIM(cp.total), '')::numeric, 0) AS open_balance
+      FROM customerpayment cp
+      WHERE LOWER(TRIM(cp."postingperiod")) IN (${placeholders})
+        ${subClause}
+
+      UNION ALL
+
+      -- Check (negative balance)
+      SELECT
+        ch.internalid,
+        'Check' AS recordtype,
+        ch.tranid,
+        ch.trandate,
+        ch.trandate AS duedate,
+        COALESCE(NULLIF(TRIM(ch.name), ''), 'No Customer/Project') AS customer_name,
+        -COALESCE(NULLIF(TRIM(ch.total), '')::numeric, 0) AS open_balance
+      FROM "check" ch
+      WHERE LOWER(TRIM(ch."postingperiod")) IN (${placeholders})
+        ${subClause}
+
+      UNION ALL
+
+      -- Deposit (negative balance)
+      SELECT
+        d.internalid,
+        'Deposit' AS recordtype,
+        d.tranid,
+        d.trandate,
+        d.trandate AS duedate,
+        COALESCE(NULLIF(TRIM(d.name), ''), 'No Customer/Project') AS customer_name,
+        -COALESCE(NULLIF(TRIM(d.total), '')::numeric, 0) AS open_balance
+      FROM deposit d
+      WHERE LOWER(TRIM(d."postingperiod")) IN (${placeholders})
+        ${subClause}
+    ),
+
+    filtered AS (
+      SELECT * FROM trx
+      WHERE ABS(open_balance) > 0.01
+    ),
+
+    aged AS (
+      SELECT
+        *,
+        CURRENT_DATE - COALESCE(
+          TO_DATE(NULLIF(TRIM(duedate), ''), 'DD/MM/YYYY'),
+          CURRENT_DATE
+        ) AS age,
+        CASE
+          WHEN CURRENT_DATE - COALESCE(TO_DATE(NULLIF(TRIM(duedate), ''), 'DD/MM/YYYY'), CURRENT_DATE) <= 30 THEN '0-30'
+          WHEN CURRENT_DATE - COALESCE(TO_DATE(NULLIF(TRIM(duedate), ''), 'DD/MM/YYYY'), CURRENT_DATE) <= 60 THEN '31-60'
+          WHEN CURRENT_DATE - COALESCE(TO_DATE(NULLIF(TRIM(duedate), ''), 'DD/MM/YYYY'), CURRENT_DATE) <= 90 THEN '61-90'
+          ELSE '90+'
+        END AS aging_bucket
+      FROM filtered
+    )
+
     SELECT
-      entity                                                                AS customer,
-      internalid                                                            AS transaction_id,
-      trandate                                                              AS transaction_date,
+      internalid,
+      customer_name,
+      recordtype,
+      trandate,
+      tranid,
       duedate,
-      isposting                                                             AS period,
-      COALESCE(NULLIF(TRIM(amount::text),'')::numeric, 0)                  AS amount,
-      CASE
-        WHEN duedate IS NOT NULL AND CURRENT_DATE - duedate::date <= 0   THEN 'Current'
-        WHEN duedate IS NOT NULL AND CURRENT_DATE - duedate::date <= 30  THEN '1-30 days'
-        WHEN duedate IS NOT NULL AND CURRENT_DATE - duedate::date <= 60  THEN '31-60 days'
-        WHEN duedate IS NOT NULL AND CURRENT_DATE - duedate::date <= 90  THEN '61-90 days'
-        ELSE 'Over 90 days'
-      END                                                                   AS aging_bucket
-    FROM "ARTransaction"
-    WHERE LOWER(TRIM(isposting)) IN (${placeholders})
-      AND entity IS NOT NULL
-      AND LOWER(TRIM(status)) = 'open'
-      ${subClause}
-    ORDER BY entity, duedate
+      open_balance,
+      age,
+      aging_bucket
+    FROM aged
+    ORDER BY customer_name, trandate
   `;
 
-  const bindings = subFilter ? [...periods, ...subFilter.bindings] : periods;
   const result = await db.raw(sql, bindings);
   return result.rows;
 }
