@@ -434,37 +434,126 @@ async function getVatReport({ fromPeriod, toPeriod, subsidiaries = [] }) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function getAPAging({ fromPeriod, toPeriod, subsidiaries = [] }) {
-  const periods = buildPeriodRange(fromPeriod, toPeriod);
+  const periods = buildTransactionPeriods(fromPeriod, toPeriod);
   if (periods.length === 0) throw Object.assign(new Error('Invalid period range'), { statusCode: 400 });
 
   const placeholders = periods.map(() => '?').join(',');
-  const subFilter = buildSubsidiaryBindings(subsidiaries);
-  const subClause = subFilter ? `AND ${subFilter.clause}` : '';
+
+  // Transaction tables use "subsidiary" column, not "glsubsidiarytext"
+  let subClause = '';
+  let subBindings = [];
+  if (subsidiaries && subsidiaries.length > 0) {
+    const normalized = subsidiaries.map(s => s.trim().toLowerCase());
+    const subPlaceholders = normalized.map(() => '?').join(',');
+    subClause = `AND LOWER(TRIM(subsidiary)) IN (${subPlaceholders})`;
+    subBindings = normalized;
+  }
+
+  // Each source table needs its own copy of period + subsidiary bindings
+  const singleBindings = [...periods, ...subBindings];
+  const bindings = [
+    ...singleBindings, // vendorbill
+    ...singleBindings, // vendorcredit
+    ...singleBindings, // vendorpayment
+    ...singleBindings, // deposit
+  ];
 
   const sql = `
+    WITH trx AS (
+      -- Bill (positive balance)
+      SELECT
+        b.internalid,
+        'Bill' AS recordtype,
+        b.tranid,
+        b.trandate,
+        b.duedate,
+        COALESCE(NULLIF(TRIM(b.name), ''), 'No Vendor') AS vendor_name,
+        COALESCE(NULLIF(TRIM(b.total), '')::numeric, 0) AS open_balance
+      FROM vendorbill b
+      WHERE LOWER(TRIM(b."postingperiod")) IN (${placeholders})
+        ${subClause}
+
+      UNION ALL
+
+      -- Vendor Credit (negative balance)
+      SELECT
+        bc.internalid,
+        'Vendor Credit' AS recordtype,
+        bc.tranid,
+        bc.trandate,
+        bc.trandate AS duedate,
+        COALESCE(NULLIF(TRIM(bc.name), ''), 'No Vendor') AS vendor_name,
+        -COALESCE(NULLIF(TRIM(bc.total), '')::numeric, 0) AS open_balance
+      FROM vendorcredit bc
+      WHERE LOWER(TRIM(bc."postingperiod")) IN (${placeholders})
+        ${subClause}
+
+      UNION ALL
+
+      -- Vendor Payment (negative balance)
+      SELECT
+        vp.internalid,
+        'Vendor Payment' AS recordtype,
+        vp.tranid,
+        vp.trandate,
+        vp.trandate AS duedate,
+        COALESCE(NULLIF(TRIM(vp.name), ''), 'No Vendor') AS vendor_name,
+        -COALESCE(NULLIF(TRIM(vp.total), '')::numeric, 0) AS open_balance
+      FROM vendorpayment vp
+      WHERE LOWER(TRIM(vp."postingperiod")) IN (${placeholders})
+        ${subClause}
+
+      UNION ALL
+
+      -- Deposit (negative balance)
+      SELECT
+        d.internalid,
+        'Deposit' AS recordtype,
+        d.tranid,
+        d.trandate,
+        d.trandate AS duedate,
+        COALESCE(NULLIF(TRIM(d.name), ''), 'No Vendor') AS vendor_name,
+        -COALESCE(NULLIF(TRIM(d.total), '')::numeric, 0) AS open_balance
+      FROM deposit d
+      WHERE LOWER(TRIM(d."postingperiod")) IN (${placeholders})
+        ${subClause}
+    ),
+
+    filtered AS (
+      SELECT * FROM trx
+      WHERE ABS(open_balance) > 0.01
+    ),
+
+    aged AS (
+      SELECT
+        *,
+        CURRENT_DATE - COALESCE(
+          TO_DATE(NULLIF(TRIM(duedate), ''), 'DD/MM/YYYY'),
+          CURRENT_DATE
+        ) AS age,
+        CASE
+          WHEN CURRENT_DATE - COALESCE(TO_DATE(NULLIF(TRIM(duedate), ''), 'DD/MM/YYYY'), CURRENT_DATE) <= 30 THEN '0-30'
+          WHEN CURRENT_DATE - COALESCE(TO_DATE(NULLIF(TRIM(duedate), ''), 'DD/MM/YYYY'), CURRENT_DATE) <= 60 THEN '31-60'
+          WHEN CURRENT_DATE - COALESCE(TO_DATE(NULLIF(TRIM(duedate), ''), 'DD/MM/YYYY'), CURRENT_DATE) <= 90 THEN '61-90'
+          ELSE '90+'
+        END AS aging_bucket
+      FROM filtered
+    )
+
     SELECT
-      entity                                                                AS vendor,
-      internalid                                                            AS transaction_id,
-      trandate                                                              AS transaction_date,
+      vendor_name,
+      internalid,
+      recordtype,
+      trandate,
+      tranid,
       duedate,
-      isposting                                                             AS period,
-      COALESCE(NULLIF(TRIM(amount::text),'')::numeric, 0)                  AS amount,
-      CASE
-        WHEN duedate IS NOT NULL AND CURRENT_DATE - duedate::date <= 0   THEN 'Current'
-        WHEN duedate IS NOT NULL AND CURRENT_DATE - duedate::date <= 30  THEN '1-30 days'
-        WHEN duedate IS NOT NULL AND CURRENT_DATE - duedate::date <= 60  THEN '31-60 days'
-        WHEN duedate IS NOT NULL AND CURRENT_DATE - duedate::date <= 90  THEN '61-90 days'
-        ELSE 'Over 90 days'
-      END                                                                   AS aging_bucket
-    FROM "APTransaction"
-    WHERE LOWER(TRIM(isposting)) IN (${placeholders})
-      AND entity IS NOT NULL
-      AND LOWER(TRIM(status)) = 'open'
-      ${subClause}
-    ORDER BY entity, duedate
+      open_balance,
+      age,
+      aging_bucket
+    FROM aged
+    ORDER BY vendor_name, trandate
   `;
 
-  const bindings = subFilter ? [...periods, ...subFilter.bindings] : periods;
   const result = await db.raw(sql, bindings);
   return result.rows;
 }
