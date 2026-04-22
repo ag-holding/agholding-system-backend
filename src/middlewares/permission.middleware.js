@@ -116,9 +116,18 @@ exports.subsidiaryFilter = (req, res, next) => {
     const subs = req.permissions.subsidiaryAccess;
     if (!subs || subs.length === 0) return query.whereRaw('1 = 0');
 
-    const normalizedSubs = subs.map(s => s.trim().toLowerCase());
+    const normalizedSubs = subs
+      .map((s) => String(s).trim().toLowerCase())
+      .filter(Boolean);
+
+    if (normalizedSubs.length === 0) return query.whereRaw('1 = 0');
+
     return query.whereRaw(
-      `LOWER(TRIM(subsidiary)) IN (${normalizedSubs.map(() => '?').join(',')})`,
+      `EXISTS (
+        SELECT 1
+        FROM unnest(string_to_array(COALESCE(subsidiary, ''), ',')) AS rec_sub
+        WHERE LOWER(BTRIM(rec_sub)) IN (${normalizedSubs.map(() => '?').join(',')})
+      )`,
       normalizedSubs
     );
   };
