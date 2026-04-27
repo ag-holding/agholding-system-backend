@@ -9,6 +9,7 @@ const SYSTEM_TABLES = new Set([
   'app_users',
   'user_permissions',
   'invitation_tokens',
+  'password_reset_tokens',
 ]);
 
 /**
