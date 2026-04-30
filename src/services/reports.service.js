@@ -129,6 +129,10 @@ async function getGeneralLedger({ fromPeriod, toPeriod, subsidiaries = [] }) {
       
       WHERE Accounttext IS NOT NULL
         AND TRIM(Accounttext) <> ''
+        AND (
+          accounttype IS NULL
+          OR TRIM(accounttype) <> 'Non Posting'
+        )
     ),
     
     /* OPENING = BEFORE FROM PERIOD */
