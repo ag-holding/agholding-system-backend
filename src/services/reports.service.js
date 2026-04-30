@@ -116,10 +116,8 @@ async function getGeneralLedger({ fromPeriod, toPeriod, subsidiaries = [] }) {
         isposting AS period,
         internalid AS transaction_id,
         line_id,
-        
         TO_DATE(trandate, 'DD-MM-YYYY') AS trandate_date,
         TO_DATE('01-' || isposting, 'DD-Mon-YY') AS period_date,
-        
         Glsubsidiarytext,
         
         COALESCE(NULLIF(TRIM(cramount), '')::numeric, 0) AS cramount_num,
@@ -129,13 +127,23 @@ async function getGeneralLedger({ fromPeriod, toPeriod, subsidiaries = [] }) {
       
       WHERE Accounttext IS NOT NULL
         AND TRIM(Accounttext) <> ''
+        
+        /* ✅ REMOVE NON-POSTING ACCOUNTS */
         AND (
           accounttype IS NULL
-          OR TRIM(accounttype) <> 'Non Posting'
+          OR LOWER(TRIM(accounttype)) <> 'non posting'
+        )
+        
+        /* ✅ REMOVE NON-GL RECORD TYPES */
+        AND LOWER(TRIM(Recordtype)) NOT IN (
+          'purchase order',
+          'opportunity',
+          'sales order',
+          'estimate'
         )
     ),
     
-    /* OPENING = BEFORE FROM PERIOD */
+    /* ✅ OPENING = BEFORE FROM PERIOD */
     opening_balance AS (
       SELECT
         b.account,
@@ -147,7 +155,7 @@ async function getGeneralLedger({ fromPeriod, toPeriod, subsidiaries = [] }) {
       GROUP BY b.account
     ),
     
-    /* CURRENT DATA = BETWEEN FROM & TO */
+    /* ✅ CURRENT DATA */
     current_data AS (
       SELECT b.*
       FROM base_data b
@@ -157,7 +165,7 @@ async function getGeneralLedger({ fromPeriod, toPeriod, subsidiaries = [] }) {
         AND NOT (b.cramount_num = 0 AND b.dramount_num = 0)
     ),
     
-    /* TRANSACTION LEVEL */
+    /* ✅ TRANSACTION LEVEL */
     transaction_level AS (
       SELECT
         account,
@@ -175,7 +183,7 @@ async function getGeneralLedger({ fromPeriod, toPeriod, subsidiaries = [] }) {
         transaction_id
     ),
     
-    /* OPENING ROW */
+    /* ✅ OPENING ROW */
     opening_row AS (
       SELECT
         o.account,
@@ -186,12 +194,12 @@ async function getGeneralLedger({ fromPeriod, toPeriod, subsidiaries = [] }) {
         NULL AS trandate,
         '0' AS cramount,
         '0' AS dramount,
-        COALESCE(o.opening_balance, 0)::TEXT AS balance,
+        COALESCE(o.opening_balance,0)::TEXT AS balance,
         -1 AS sort_order
       FROM opening_balance o
     ),
     
-    /* DETAIL */
+    /* ✅ DETAIL DATA */
     detail_data AS (
       SELECT
         t.account,
@@ -199,7 +207,7 @@ async function getGeneralLedger({ fromPeriod, toPeriod, subsidiaries = [] }) {
         t.period,
         t.transaction_id,
         NULL AS line_id,
-        t.trandate_date::TEXT AS trandate,
+        TO_CHAR(t.trandate_date, 'DD-MM-YYYY') AS trandate,
         
         t.cramount_num::TEXT AS cramount,
         t.dramount_num::TEXT AS dramount,
@@ -220,6 +228,7 @@ async function getGeneralLedger({ fromPeriod, toPeriod, subsidiaries = [] }) {
         ON t.account = o.account
     )
     
+    /* ✅ FINAL OUTPUT */
     SELECT *
     FROM (
       SELECT * FROM opening_row
@@ -230,7 +239,7 @@ async function getGeneralLedger({ fromPeriod, toPeriod, subsidiaries = [] }) {
     ORDER BY 
       account,
       sort_order,
-      trandate,
+      TO_DATE(trandate, 'DD-MM-YYYY'),
       transaction_id
   `;
 
