@@ -9,6 +9,8 @@ const {
   requestPasswordReset,
   verifyPasswordResetToken,
   resetPassword,
+  updateUserProfile,
+  setUserStatus,
 } = require('../services/user.services');
 const { db } = require('../config/database');
 const { listClientTables } = require('../services/getdata.services');
@@ -146,14 +148,30 @@ exports.updateUserRole = async (req, res, next) => {
   }
 };
 
-exports.removeUser = async (req, res, next) => {
+
+exports.setUserStatus = async (req, res, next) => {
   try {
     const userId = parseInt(req.params.id, 10);
     if (req.user.userId === userId) {
-      return res.status(400).json({ success: false, error: 'You cannot remove yourself' });
+      return res.status(400).json({ success: false, error: 'You cannot change your own status' });
     }
-    await removeUser(userId);
-    res.json({ success: true, message: 'User removed' });
+    const { status } = req.body;
+    const updated = await setUserStatus(userId, status);
+    res.json({ success: true, data: updated });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ success: false, error: error.message });
+    next(error);
+  }
+};
+
+// ─── Profile ─────────────────────────────────────────────────────────────────
+
+exports.updateProfile = async (req, res, next) => {
+  try {
+    const userId = req.user.userId;
+    const { name } = req.body;
+    const updated = await updateUserProfile(userId, { name });
+    res.json({ success: true, data: updated });
   } catch (error) {
     if (error.statusCode) return res.status(error.statusCode).json({ success: false, error: error.message });
     next(error);

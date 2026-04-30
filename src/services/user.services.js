@@ -165,11 +165,18 @@ async function updateUserRole(userId, { roleId }) {
   return { success: true };
 }
 
-async function removeUser(userId) {
-  const user = await db('app_users').where({ id: userId }).first();
-  if (!user) throw Object.assign(new Error('User not found'), { statusCode: 404 });
-  await db('app_users').where({ id: userId }).delete();
-  return { success: true };
+async function setUserStatus(userId, status) {
+  if (!['Active', 'Inactive'].includes(status)) {
+    throw Object.assign(new Error('Invalid status'), { statusCode: 400 });
+  }
+  const updated = await db('app_users')
+    .where({ id: userId })
+    .update({ status })
+    .returning(['id', 'name', 'email', 'role', 'role_id', 'status']);
+  if (!updated || updated.length === 0) {
+    throw Object.assign(new Error('User not found'), { statusCode: 404 });
+  }
+  return updated[0];
 }
 
 async function getUserById(userId) {
@@ -257,6 +264,23 @@ async function resetPassword({ token, newPassword }) {
   return { success: true, message: 'Password reset successfully' };
 }
 
+// ─── Profile ─────────────────────────────────────────────────────────────────
+
+async function updateUserProfile(userId, { name }) {
+  const trimmed = name && name.trim();
+  if (!trimmed) {
+    throw Object.assign(new Error('name is required'), { statusCode: 400 });
+  }
+  const updated = await db('app_users')
+    .where({ id: userId })
+    .update({ name: trimmed })
+    .returning(['id', 'name', 'email', 'role', 'role_id', 'status']);
+  if (!updated || updated.length === 0) {
+    throw Object.assign(new Error('User not found'), { statusCode: 404 });
+  }
+  return updated[0];
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function parseJsonb(val) {
@@ -271,9 +295,10 @@ module.exports = {
   inviteUser,
   acceptInvitation,
   updateUserRole,
-  removeUser,
+  setUserStatus,
   getUserById,
   requestPasswordReset,
   verifyPasswordResetToken,
   resetPassword,
+  updateUserProfile,
 };

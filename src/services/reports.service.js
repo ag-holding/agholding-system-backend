@@ -88,55 +88,151 @@ function buildSubsidiaryBindings(subsidiaries) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function getGeneralLedger({ fromPeriod, toPeriod, subsidiaries = [] }) {
-  const periods = buildPeriodRange(fromPeriod, toPeriod);
-  if (periods.length === 0) throw Object.assign(new Error('Invalid period range'), { statusCode: 400 });
+  if (!fromPeriod || !toPeriod) throw Object.assign(new Error('Invalid period range'), { statusCode: 400 });
 
-  const placeholders = periods.map(() => '?').join(',');
+  // Build subsidiary filter for base_data, opening_balance, and current_data CTEs
   const subFilter = buildSubsidiaryBindings(subsidiaries);
   const subClause = subFilter ? `AND ${subFilter.clause}` : '';
 
   const sql = `
-    WITH base AS (
+    WITH params AS (
+      SELECT 
+        ? AS from_period,
+        ? AS to_period
+    ),
+    
+    date_range AS (
       SELECT
-        accounttext,
-        "recordtype",
-        isposting,
-        internalid,
-        COALESCE(NULLIF(TRIM(crfxamount::text), '')::numeric, 0) AS cr,
-        COALESCE(NULLIF(TRIM(drfxamount::text), '')::numeric, 0) AS dr
-      FROM "GLImpact_table"
-      WHERE LOWER(TRIM(isposting)) IN (${placeholders})
-        AND LOWER(TRIM("recordtype")) NOT IN ('currency revaluation', 'deliver note')
-        ${subClause}
-    )
-    SELECT account, "recordtype", period, transaction_id,
-           crfxamount, drfxamount, drfxamount - crfxamount AS balance
-    FROM (
+        TO_DATE('01-' || from_period, 'DD-Mon-YY') AS start_date,
+        (TO_DATE('01-' || to_period, 'DD-Mon-YY') 
+          + INTERVAL '1 month' - INTERVAL '1 day') AS end_date
+      FROM params
+    ),
+    
+    base_data AS (
       SELECT
-        accounttext AS account,
-        "recordtype",
+        Accounttext AS account,
+        Recordtype,
         isposting AS period,
         internalid AS transaction_id,
-        SUM(cr) AS crfxamount,
-        SUM(dr) AS drfxamount
-      FROM base
-      WHERE accounttext IS NOT NULL AND TRIM(accounttext) <> ''
-      GROUP BY accounttext, "recordtype", isposting, internalid
-
+        line_id,
+        
+        TO_DATE(trandate, 'DD-MM-YYYY') AS trandate_date,
+        TO_DATE('01-' || isposting, 'DD-Mon-YY') AS period_date,
+        
+        Glsubsidiarytext,
+        
+        COALESCE(NULLIF(TRIM(cramount), '')::numeric, 0) AS cramount_num,
+        COALESCE(NULLIF(TRIM(dramount), '')::numeric, 0) AS dramount_num
+      
+      FROM "GLImpact_table"
+      
+      WHERE Accounttext IS NOT NULL
+        AND TRIM(Accounttext) <> ''
+    ),
+    
+    /* OPENING = BEFORE FROM PERIOD */
+    opening_balance AS (
+      SELECT
+        b.account,
+        SUM(b.dramount_num - b.cramount_num) AS opening_balance
+      FROM base_data b
+      CROSS JOIN date_range p
+      WHERE b.period_date < p.start_date
+        ${subClause}
+      GROUP BY b.account
+    ),
+    
+    /* CURRENT DATA = BETWEEN FROM & TO */
+    current_data AS (
+      SELECT b.*
+      FROM base_data b
+      CROSS JOIN date_range p
+      WHERE b.period_date BETWEEN p.start_date AND p.end_date
+        ${subClause}
+        AND NOT (b.cramount_num = 0 AND b.dramount_num = 0)
+    ),
+    
+    /* TRANSACTION LEVEL */
+    transaction_level AS (
+      SELECT
+        account,
+        Recordtype,
+        period,
+        transaction_id,
+        MIN(trandate_date) AS trandate_date,
+        SUM(dramount_num) AS dramount_num,
+        SUM(cramount_num) AS cramount_num
+      FROM current_data
+      GROUP BY
+        account,
+        Recordtype,
+        period,
+        transaction_id
+    ),
+    
+    /* OPENING ROW */
+    opening_row AS (
+      SELECT
+        o.account,
+        'Opening Balance' AS Recordtype,
+        NULL AS period,
+        NULL AS transaction_id,
+        NULL AS line_id,
+        NULL AS trandate,
+        '0' AS cramount,
+        '0' AS dramount,
+        COALESCE(o.opening_balance, 0)::TEXT AS balance,
+        -1 AS sort_order
+      FROM opening_balance o
+    ),
+    
+    /* DETAIL */
+    detail_data AS (
+      SELECT
+        t.account,
+        t.Recordtype,
+        t.period,
+        t.transaction_id,
+        NULL AS line_id,
+        t.trandate_date::TEXT AS trandate,
+        
+        t.cramount_num::TEXT AS cramount,
+        t.dramount_num::TEXT AS dramount,
+        
+        (
+          COALESCE(o.opening_balance, 0)
+          +
+          SUM(t.dramount_num - t.cramount_num) OVER (
+            PARTITION BY t.account
+            ORDER BY t.trandate_date, t.transaction_id
+          )
+        )::TEXT AS balance,
+        
+        0 AS sort_order
+      
+      FROM transaction_level t
+      LEFT JOIN opening_balance o
+        ON t.account = o.account
+    )
+    
+    SELECT *
+    FROM (
+      SELECT * FROM opening_row
       UNION ALL
-
-      SELECT 'TOTAL', NULL, NULL, NULL, SUM(cr), SUM(dr)
-      FROM base
-    ) t
-    ORDER BY
-      CASE WHEN account = 'TOTAL' THEN 1 ELSE 0 END,
-      transaction_id,
-      account
+      SELECT * FROM detail_data
+    ) final
+    
+    ORDER BY 
+      account,
+      sort_order,
+      trandate,
+      transaction_id
   `;
 
   const bindings = subFilter
-    ? [...periods, ...subFilter.bindings]
-    : [...periods];
+    ? [fromPeriod, toPeriod, ...subFilter.bindings, ...subFilter.bindings]
+    : [fromPeriod, toPeriod];
 
   const result = await db.raw(sql, bindings);
   return result.rows;

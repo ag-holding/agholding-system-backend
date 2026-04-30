@@ -15,6 +15,7 @@ router.post('/reset-password', userCtrl.resetPassword);
 // ─── Authenticated ───────────────────────────────────────────────────────────
 router.get('/subsidiaries', verifyToken, userCtrl.getSubsidiaries);
 router.get('/modules', verifyToken, requireAdmin, userCtrl.getModules);
+router.put('/profile', verifyToken, userCtrl.updateProfile);
 
 // ─── Admin only ──────────────────────────────────────────────────────────────
 router.get('/', verifyToken, requireAdmin, userCtrl.listUsers);
@@ -24,6 +25,6 @@ router.post('/invite', verifyToken, requireAdmin, userCtrl.inviteUser);
 // Role assignment (replaces the old per-user subsidiary+module editing)
 router.put('/:id/role', verifyToken, requireAdmin, userCtrl.updateUserRole);
 
-router.delete('/:id', verifyToken, requireAdmin, userCtrl.removeUser);
+router.put('/:id/status', verifyToken, requireAdmin, userCtrl.setUserStatus);
 
 module.exports = router;
