@@ -97,65 +97,107 @@ async function getGeneralLedger({ fromPeriod, toPeriod, subsidiaries = [] }) {
   const sql = `
     WITH params AS (
       SELECT 
-        ? AS from_period,
-        ? AS to_period
+        ? AS from_period,   -- 🔥 USER INPUT
+        ? AS to_period      -- 🔥 USER INPUT
     ),
     
     date_range AS (
       SELECT
-        TO_DATE('01-' || from_period, 'DD-Mon-YY') AS start_date,
-        (TO_DATE('01-' || to_period, 'DD-Mon-YY') 
-          + INTERVAL '1 month' - INTERVAL '1 day') AS end_date
+        TO_DATE('01-' || from_period, 'DD-Mon-YY')                        AS start_date,
+        (TO_DATE('01-' || to_period,  'DD-Mon-YY')
+            + INTERVAL '1 month' - INTERVAL '1 day')                      AS end_date
       FROM params
     ),
     
     base_data AS (
       SELECT
-        Accounttext AS account,
-        Recordtype,
-        isposting AS period,
-        internalid AS transaction_id,
-        line_id,
-        TO_DATE(trandate, 'DD-MM-YYYY') AS trandate_date,
-        TO_DATE('01-' || isposting, 'DD-Mon-YY') AS period_date,
-        Glsubsidiarytext,
+        g.Accounttext                                                      AS account,
+        g.accounttype,
+        g.Recordtype,
+        g.isposting                                                        AS period,
+        g.internalid                                                       AS transaction_id,
+        g.line_id,
         
-        COALESCE(NULLIF(TRIM(cramount), '')::numeric, 0) AS cramount_num,
-        COALESCE(NULLIF(TRIM(dramount), '')::numeric, 0) AS dramount_num
-      
-      FROM "GLImpact_table"
-      
-      WHERE Accounttext IS NOT NULL
-        AND TRIM(Accounttext) <> ''
+        /* trandate_date  — used for detail row ordering and display      */
+        TO_DATE(g.trandate, 'DD-MM-YYYY')                                 AS trandate_date,
         
-        /* ✅ REMOVE NON-POSTING ACCOUNTS */
+        /* period_date   — used for ALL date-range filtering.
+           This matches NetSuite's posting period (isposting field),
+           which is what the Custom GL / Trial Balance report uses.
+           ⚠️  Do NOT use trandate for period filtering — some journal
+           entries have trandate in a different month than isposting.     */
+        TO_DATE('01-' || g.isposting, 'DD-Mon-YY')                       AS period_date,
+        
+        g.Glsubsidiarytext,
+        COALESCE(NULLIF(TRIM(g.cramount), '')::NUMERIC, 0)                AS cramount_num,
+        COALESCE(NULLIF(TRIM(g.dramount), '')::NUMERIC, 0)                AS dramount_num
+      
+      FROM "GLImpact_table" g
+      
+      WHERE g.Accounttext IS NOT NULL
+        AND TRIM(g.Accounttext) <> ''
+        
+        /* ── Exclude NonPosting account types ────────────────────────
+           Estimates, PO, SO, Opportunities etc. have accounttype =
+           'NonPosting' in the chart of accounts. Exclude at source.     */
         AND (
-          accounttype IS NULL
-          OR LOWER(TRIM(accounttype)) <> 'non posting'
+            g.accounttype IS NULL
+            OR LOWER(TRIM(g.accounttype)) <> 'nonposting'
         )
         
-        /* ✅ REMOVE NON-GL RECORD TYPES */
-        AND LOWER(TRIM(Recordtype)) NOT IN (
-          'purchase order',
-          'opportunity',
-          'sales order',
-          'estimate'
+        /* ── Exclude non-GL record types ─────────────────────────────
+           Belt-and-suspenders safety net on top of accounttype filter.  */
+        AND LOWER(TRIM(g.Recordtype)) NOT IN (
+            'purchase order',
+            'opportunity',
+            'sales order',
+            'estimate',
+            'requisition',
+            'transfer order'
         )
     ),
     
-    /* ✅ OPENING = BEFORE FROM PERIOD */
+    /* ── OPENING BALANCE ────────────────────────────────────────────
+       FIX 1 + FIX 2 both applied here.
+    
+       P&L account types (Income / COGS / Expense / OthIncome /
+       OthExpense) → opening always 0. These are period-only accounts
+       that reset at the start of each accounting year (Jan 1).
+    
+       All other account types (Balance Sheet: AcctRec, AcctPay, Bank,
+       OthCurrAsset, OthCurrLiab, FixedAsset, OthAsset, Equity,
+       LongTermLiab, etc.) → cumulative DR-CR before the period start.
+       This includes Prepaid rent (OthAsset) and similar BS accounts.
+    
+       period_date (isposting) is used — NOT trandate — so the split
+       matches NetSuite Custom GL exactly.
+       ─────────────────────────────────────────────────────────────── */
     opening_balance AS (
       SELECT
         b.account,
-        SUM(b.dramount_num - b.cramount_num) AS opening_balance
+        CASE
+            WHEN TRIM(b.accounttype) IN (
+                'Income',
+                'COGS',
+                'Expense',
+                'OthIncome',
+                'OthExpense'
+            )
+            THEN 0  -- P&L: opening always zero
+    
+            ELSE SUM(b.dramount_num - b.cramount_num)  -- BS: carry forward
+        END AS opening_balance
+      
       FROM base_data b
       CROSS JOIN date_range p
+      
       WHERE b.period_date < p.start_date
         ${subClause}
-      GROUP BY b.account
+      
+      GROUP BY b.account, b.accounttype
     ),
     
-    /* ✅ CURRENT DATA */
+    /* ── CURRENT PERIOD TRANSACTIONS ─────────────────────────────── */
     current_data AS (
       SELECT b.*
       FROM base_data b
@@ -165,16 +207,16 @@ async function getGeneralLedger({ fromPeriod, toPeriod, subsidiaries = [] }) {
         AND NOT (b.cramount_num = 0 AND b.dramount_num = 0)
     ),
     
-    /* ✅ TRANSACTION LEVEL */
+    /* ── TRANSACTION LEVEL ───────────────────────────────────────── */
     transaction_level AS (
       SELECT
         account,
         Recordtype,
         period,
         transaction_id,
-        MIN(trandate_date) AS trandate_date,
-        SUM(dramount_num) AS dramount_num,
-        SUM(cramount_num) AS cramount_num
+        MIN(trandate_date)  AS trandate_date,
+        SUM(dramount_num)   AS dramount_num,
+        SUM(cramount_num)   AS cramount_num
       FROM current_data
       GROUP BY
         account,
@@ -183,52 +225,61 @@ async function getGeneralLedger({ fromPeriod, toPeriod, subsidiaries = [] }) {
         transaction_id
     ),
     
-    /* ✅ OPENING ROW */
+    /* ── OPENING ROW ─────────────────────────────────────────────── */
     opening_row AS (
       SELECT
         o.account,
-        'Opening Balance' AS Recordtype,
-        NULL AS period,
-        NULL AS transaction_id,
-        NULL AS line_id,
-        NULL AS trandate,
-        '0' AS cramount,
-        '0' AS dramount,
-        COALESCE(o.opening_balance,0)::TEXT AS balance,
-        -1 AS sort_order
+        'Opening Balance'                    AS Recordtype,
+        NULL                                 AS period,
+        NULL                                 AS transaction_id,
+        NULL                                 AS line_id,
+        NULL                                 AS trandate,
+        '0'                                  AS cramount,
+        '0'                                  AS dramount,
+        COALESCE(o.opening_balance, 0)::TEXT AS balance,
+        -1                                   AS sort_order
       FROM opening_balance o
+      
+      /* FIX 3: Only emit opening row for accounts with current-period
+         activity. Prevents stray 0-opening rows for P&L accounts that
+         had prior-year history but no current-period transactions.       */
+      WHERE o.account IN (SELECT DISTINCT account FROM current_data)
     ),
     
-    /* ✅ DETAIL DATA */
+    /* ── DETAIL ROWS ─────────────────────────────────────────────── */
     detail_data AS (
       SELECT
         t.account,
         t.Recordtype,
         t.period,
         t.transaction_id,
-        NULL AS line_id,
-        TO_CHAR(t.trandate_date, 'DD-MM-YYYY') AS trandate,
+        NULL                                       AS line_id,
+        TO_CHAR(t.trandate_date, 'DD-MM-YYYY')    AS trandate,
+        t.cramount_num::TEXT                       AS cramount,
+        t.dramount_num::TEXT                       AS dramount,
         
-        t.cramount_num::TEXT AS cramount,
-        t.dramount_num::TEXT AS dramount,
-        
+        /* Running balance per account.
+           Ordered by trandate_date within period so the balance
+           progression makes sense in the detail view.
+           The STARTING point is the opening_balance (which itself
+           uses period_date/isposting for its boundary, matching NS). */
         (
-          COALESCE(o.opening_balance, 0)
-          +
-          SUM(t.dramount_num - t.cramount_num) OVER (
-            PARTITION BY t.account
-            ORDER BY t.trandate_date, t.transaction_id
-          )
-        )::TEXT AS balance,
+            COALESCE(o.opening_balance, 0)
+            +
+            SUM(t.dramount_num - t.cramount_num) OVER (
+                PARTITION BY t.account
+                ORDER BY t.trandate_date, t.transaction_id
+            )
+        )::TEXT                                    AS balance,
         
-        0 AS sort_order
+        0                                          AS sort_order
       
       FROM transaction_level t
       LEFT JOIN opening_balance o
         ON t.account = o.account
     )
     
-    /* ✅ FINAL OUTPUT */
+    /* ── FINAL OUTPUT ────────────────────────────────────────────── */
     SELECT *
     FROM (
       SELECT * FROM opening_row
@@ -236,7 +287,7 @@ async function getGeneralLedger({ fromPeriod, toPeriod, subsidiaries = [] }) {
       SELECT * FROM detail_data
     ) final
     
-    ORDER BY 
+    ORDER BY
       account,
       sort_order,
       TO_DATE(trandate, 'DD-MM-YYYY'),
