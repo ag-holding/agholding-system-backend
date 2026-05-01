@@ -307,46 +307,111 @@ async function getGeneralLedger({ fromPeriod, toPeriod, subsidiaries = [] }) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function getTrialBalance({ fromPeriod, toPeriod, subsidiaries = [] }) {
-  const periods = buildPeriodRange(fromPeriod, toPeriod);
-  if (periods.length === 0) throw Object.assign(new Error('Invalid period range'), { statusCode: 400 });
+  if (!fromPeriod || !toPeriod) throw Object.assign(new Error('Invalid period range'), { statusCode: 400 });
 
-  const placeholders = periods.map(() => '?').join(',');
   const subFilter = buildSubsidiaryBindings(subsidiaries);
   const subClause = subFilter ? `AND ${subFilter.clause}` : '';
 
   const sql = `
-    WITH base AS (
+    WITH params AS (
+      SELECT 
+        ? AS from_period,
+        ? AS to_period
+    ),
+    
+    date_range AS (
       SELECT
-        accounttext,
-        COALESCE(NULLIF(TRIM(drfxamount::text), '')::numeric, 0) AS dr,
-        COALESCE(NULLIF(TRIM(crfxamount::text), '')::numeric, 0) AS cr
+        TO_DATE('01-' || from_period, 'DD-Mon-YY') AS start_date,
+        (TO_DATE('01-' || to_period, 'DD-Mon-YY') 
+          + INTERVAL '1 month' - INTERVAL '1 day') AS end_date
+      FROM params
+    ),
+    
+    base_data AS (
+      SELECT
+        Accounttext AS account,
+        TO_DATE('01-' || isposting, 'DD-Mon-YY') AS period_date,
+        Glsubsidiarytext,
+        
+        COALESCE(NULLIF(TRIM(cramount), '')::numeric, 0) AS cramount,
+        COALESCE(NULLIF(TRIM(dramount), '')::numeric, 0) AS dramount
+      
       FROM "GLImpact_table"
-      WHERE LOWER(TRIM(isposting)) IN (${placeholders})
-        AND accounttext IS NOT NULL
-        AND TRIM(accounttext) <> ''
-        AND LOWER(TRIM("recordtype")) NOT IN ('currency revaluation', 'delivery note')
-        ${subClause}
-    )
-    SELECT account, debit, credit
-    FROM (
+      
+      WHERE Accounttext IS NOT NULL
+        AND TRIM(Accounttext) <> ''
+        
+        AND (
+          accounttype IS NULL
+          OR LOWER(TRIM(accounttype)) <> 'non posting'
+        )
+        
+        /* ✅ Exclude non-GL record types */
+        AND LOWER(TRIM(Recordtype)) NOT IN (
+          'purchase order',
+          'opportunity',
+          'sales order',
+          'estimate'
+        )
+    ),
+    
+    trial_balance AS (
       SELECT
-        accounttext AS account,
-        SUM(dr) AS debit,
-        SUM(cr) AS credit
-      FROM base
-      GROUP BY accounttext
-
-      UNION ALL
-
-      SELECT 'TOTAL', SUM(dr), SUM(cr)
-      FROM base
-    ) t
-    ORDER BY
-      CASE WHEN account = 'TOTAL' THEN 1 ELSE 0 END,
-      account
+        b.account,
+        
+        /* ✅ OPENING (before period) */
+        SUM(
+          CASE
+            WHEN b.period_date < p.start_date
+            THEN b.dramount - b.cramount
+            ELSE 0
+          END
+        ) AS opening_balance,
+        
+        /* ✅ PERIOD MOVEMENT */
+        SUM(
+          CASE
+            WHEN b.period_date BETWEEN p.start_date AND p.end_date
+            THEN b.dramount - b.cramount
+            ELSE 0
+          END
+        ) AS period_balance
+      
+      FROM base_data b
+      CROSS JOIN date_range p
+      
+      WHERE TRIM(b.Glsubsidiarytext) = 'AG Holding : AGBL Group : Alliance Global FZ-LLC'
+        ${subClause}
+      
+      GROUP BY b.account
+    )
+    
+    SELECT
+      account,
+      
+      CASE 
+        WHEN (opening_balance + period_balance) > 0 
+        THEN (opening_balance + period_balance)
+        ELSE 0
+      END AS debit,
+      
+      CASE 
+        WHEN (opening_balance + period_balance) < 0 
+        THEN ABS(opening_balance + period_balance)
+        ELSE 0
+      END AS credit
+    
+    FROM trial_balance
+    
+    WHERE (opening_balance + period_balance) <> 0
+    
+    ORDER BY account
   `;
 
-  const bindings = subFilter ? [...periods, ...subFilter.bindings] : periods;
+  const bindings = subFilter 
+    ? [fromPeriod, toPeriod, ...subFilter.bindings] 
+    : [fromPeriod, toPeriod];
+  
   const result = await db.raw(sql, bindings);
   return result.rows;
 }
