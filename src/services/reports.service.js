@@ -383,93 +383,169 @@ async function getIncomeStatement({ fromPeriod, toPeriod, subsidiaries = [] }) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function getBalanceSheet({ fromPeriod, toPeriod, subsidiaries = [] }) {
-  const periods = buildPeriodRange(fromPeriod, toPeriod);
-  if (periods.length === 0) throw Object.assign(new Error('Invalid period range'), { statusCode: 400 });
+  if (!fromPeriod || !toPeriod) throw Object.assign(new Error('Invalid period range'), { statusCode: 400 });
 
-  const placeholders = periods.map(() => '?').join(',');
+  // Build subsidiary filter
   const subFilter = buildSubsidiaryBindings(subsidiaries);
   const subClause = subFilter ? `AND ${subFilter.clause}` : '';
 
   const sql = `
-    WITH detail_data AS (
+    WITH params AS (
+      SELECT 
+        ? AS from_period,
+        ? AS to_period
+    ),
+    date_range AS (
       SELECT
-        g.internalid,
-        g.accounttext AS account,
-        g.accounttype AS account_type,
-        MIN(g.recordtype) AS recordtype,
-        CASE
-          WHEN g.accounttype IN (
-            'Bank','Accounts Receivable','Other Current Asset',
-            'Fixed Asset','Other Asset'
-          ) THEN 'Assets'
-          WHEN g.accounttype IN (
-            'Accounts Payable','Credit Card',
-            'Other Current Liability','Long Term Liability'
-          ) THEN 'Liabilities'
-          WHEN g.accounttype = 'Equity' THEN 'Equity'
-        END AS category,
-        SUM(COALESCE(NULLIF(TRIM(g.drfxamount), '')::numeric, 0)) AS dr,
-        SUM(COALESCE(NULLIF(TRIM(g.crfxamount), '')::numeric, 0)) AS cr
+        TO_DATE('01-' || from_period, 'DD-Mon-YY') AS start_date,
+        (TO_DATE('01-' || to_period, 'DD-Mon-YY') 
+          + INTERVAL '1 month' - INTERVAL '1 day') AS end_date
+      FROM params
+    ),
+    base_data AS (
+      SELECT
+        g.Accounttext AS account,
+        g.Recordtype,
+        g.glentitytext AS entitytext,
+        g.internalid AS transaction_id,
+        TO_DATE(g.trandate, 'DD-MM-YYYY') AS trandate,
+        TO_DATE('01-' || g.isposting, 'DD-Mon-YY') AS period_date,
+        COALESCE(NULLIF(TRIM(g.dramount), '')::numeric, 0) AS dr,
+        COALESCE(NULLIF(TRIM(g.cramount), '')::numeric, 0) AS cr
       FROM "GLImpact_table" g
-      WHERE LOWER(TRIM(g.isposting)) IN (${placeholders})
-        AND g.accounttext IS NOT NULL
-        AND TRIM(g.accounttext) <> ''
-        AND LOWER(TRIM(g.recordtype)) NOT IN ('currency revaluation', 'delivery note')
-        AND g.accounttype IN (
-          'Bank','Accounts Receivable','Other Current Asset',
-          'Fixed Asset','Other Asset',
-          'Accounts Payable','Credit Card',
-          'Other Current Liability','Long Term Liability',
-          'Equity'
-        )
+      WHERE g.Accounttext IS NOT NULL
+        AND TRIM(g.Accounttext) <> ''
         ${subClause}
-      GROUP BY g.internalid, g.accounttext, g.accounttype
+        AND TRIM(g.accounttype) IN (
+          'Bank','Accounts Receivable','Accounts Payable','Other Current Asset','Other Current Liability',
+          'Fixed Asset','Other Asset','Long Term Liability','Equity',
+          'Deferred Expense','Deferred Revenue','Unbilled Receivable'
+        )
+        AND LOWER(TRIM(g.Recordtype)) NOT IN (
+          'purchase order','sales order','estimate','opportunity',
+          'requisition','transfer order'
+        )
+        AND g.trandate IS NOT NULL
     ),
-    non_equity AS (
+    opening_balance AS (
       SELECT
-        internalid, recordtype, category, account, account_type,
-        CASE
-          WHEN category = 'Assets' THEN dr - cr
-          ELSE cr - dr
-        END AS amount
-      FROM detail_data
-      WHERE category <> 'Equity'
+        account,
+        SUM(dr - cr) AS opening_balance
+      FROM base_data b
+      CROSS JOIN date_range d
+      WHERE b.period_date < d.start_date
+      GROUP BY account
     ),
-    equity_split AS (
-      SELECT internalid, recordtype, category, account, account_type, -dr AS amount
-      FROM detail_data
-      WHERE category = 'Equity' AND dr <> 0
-      UNION ALL
-      SELECT internalid, recordtype, category, account, account_type, cr AS amount
-      FROM detail_data
-      WHERE category = 'Equity' AND cr <> 0
+    current_data AS (
+      SELECT *
+      FROM base_data b
+      CROSS JOIN date_range d
+      WHERE b.period_date BETWEEN d.start_date AND d.end_date
     ),
-    all_data AS (
-      SELECT * FROM non_equity
-      UNION ALL
-      SELECT * FROM equity_split
+    /* ── OPENING ROW for accounts that HAVE current period activity ──
+       Shows the brought-forward balance as the first row per account,
+       same pattern as the General Ledger SQL                          */
+    opening_row AS (
+      SELECT
+        o.account,
+        'Opening Balance'    AS Recordtype,
+        NULL::TEXT           AS transaction_id,
+        NULL::DATE           AS trandate,
+        NULL::TEXT           AS entitytext,
+        0::numeric           AS amount,
+        COALESCE(o.opening_balance, 0) AS balance
+      FROM opening_balance o
+      WHERE o.account IN (
+        SELECT DISTINCT account FROM current_data
+      )
     ),
-    final AS (
-      SELECT internalid, recordtype, category, account, account_type, amount, 1 AS sort_order
-      FROM all_data
-      UNION ALL
-      SELECT NULL, NULL, category, 'Total ' || category, NULL, ABS(SUM(amount)), 2
-      FROM all_data
-      GROUP BY category
+    detail_data AS (
+      SELECT
+        c.account,
+        c.Recordtype,
+        c.transaction_id,
+        c.trandate,
+        c.entitytext,
+        (c.dr - c.cr) AS amount,
+        (
+          COALESCE(o.opening_balance, 0)
+          +
+          SUM(c.dr - c.cr) OVER (
+            PARTITION BY c.account
+            ORDER BY 
+              c.trandate NULLS FIRST,
+              c.transaction_id 
+          )
+        ) AS balance
+      FROM current_data c
+      LEFT JOIN opening_balance o
+        ON c.account = o.account
+    ),
+    opening_only_accounts AS (
+      SELECT
+        o.account,
+        'Opening Balance' AS Recordtype,
+        NULL::TEXT AS transaction_id,
+        NULL::DATE AS trandate,
+        NULL::TEXT AS entitytext,
+        0::numeric AS amount,
+        o.opening_balance AS balance
+      FROM opening_balance o
+      WHERE o.account NOT IN (
+        SELECT DISTINCT account FROM current_data
+      )
     )
-    SELECT internalid, recordtype, category, account, account_type, amount
-    FROM final
-    ORDER BY
-      CASE category
-        WHEN 'Assets' THEN 1
-        WHEN 'Liabilities' THEN 2
-        WHEN 'Equity' THEN 3
-      END,
-      sort_order,
-      account
+    /* ✅ FINAL OUTPUT WITH FILTER */
+    SELECT *
+    FROM (
+      /* Opening row for accounts WITH current period activity */
+      SELECT 
+        account,
+        Recordtype,
+        transaction_id,
+        trandate,
+        entitytext,
+        amount,
+        balance
+      FROM opening_row
+      
+      UNION ALL
+      
+      SELECT 
+        account,
+        Recordtype,
+        transaction_id,
+        trandate,
+        entitytext,
+        amount,
+        balance
+      FROM detail_data
+      
+      UNION ALL
+      
+      /* Opening row for accounts WITHOUT current period activity */
+      SELECT 
+        account,
+        Recordtype,
+        transaction_id,
+        trandate,
+        entitytext,
+        amount,
+        balance
+      FROM opening_only_accounts
+    ) final
+    /* 🔥 REMOVE ZERO AMOUNT ROWS (EXCEPT OPENING) */
+    WHERE NOT (
+      amount = 0 
+      AND Recordtype <> 'Opening Balance'
+    )
+    ORDER BY 
+      account,
+      trandate NULLS FIRST,
+      transaction_id
   `;
 
-  const bindings = subFilter ? [...periods, ...subFilter.bindings] : periods;
+  const bindings = subFilter ? [fromPeriod, toPeriod, ...subFilter.bindings] : [fromPeriod, toPeriod];
   const result = await db.raw(sql, bindings);
   return result.rows;
 }
