@@ -421,75 +421,144 @@ async function getTrialBalance({ fromPeriod, toPeriod, subsidiaries = [] }) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function getIncomeStatement({ fromPeriod, toPeriod, subsidiaries = [] }) {
-  const periods = buildPeriodRange(fromPeriod, toPeriod);
-  if (periods.length === 0) throw Object.assign(new Error('Invalid period range'), { statusCode: 400 });
+  if (!fromPeriod || !toPeriod) throw Object.assign(new Error('Invalid period range'), { statusCode: 400 });
 
-  const placeholders = periods.map(() => '?').join(',');
+  // Build subsidiary filter
   const subFilter = buildSubsidiaryBindings(subsidiaries);
   const subClause = subFilter ? `AND ${subFilter.clause}` : '';
 
   const sql = `
-    WITH detail_data AS (
+    WITH params AS (
       SELECT
-        g.internalid,
-        g.accounttext AS account,
-        g.accounttype AS account_type,
-        MIN(g.recordtype) AS recordtype,
-        CASE
-          WHEN g.accounttype IN ('Income','Other Income') THEN 'Income'
-          WHEN g.accounttype IN ('Cost of Goods Sold') THEN 'COGS'
-          WHEN g.accounttype IN ('Expense','Other Expense') THEN 'Expenses'
-        END AS category,
-        SUM(COALESCE(NULLIF(TRIM(g.drfxamount), '')::numeric, 0)) AS dr,
-        SUM(COALESCE(NULLIF(TRIM(g.crfxamount), '')::numeric, 0)) AS cr
+        ? AS from_period,   -- 🔥 USER INPUT
+        ? AS to_period      -- 🔥 USER INPUT
+    ),
+    
+    date_range AS (
+      SELECT
+        TO_DATE('01-' || from_period, 'DD-Mon-YY')                        AS start_date,
+        (TO_DATE('01-' || to_period,  'DD-Mon-YY')
+          + INTERVAL '1 month' - INTERVAL '1 day')                      AS end_date
+      FROM params
+    ),
+    
+    base_data AS (
+      SELECT
+        g.Accounttext                                                      AS account,
+        g.accounttype,
+        g.Recordtype,
+        g.glentitytext                                                     AS entitytext,
+        g.internalid                                                       AS transaction_id,
+    
+        TO_DATE(g.trandate, 'DD-MM-YYYY')                                 AS trandate,
+    
+        TO_DATE('01-' || g.isposting, 'DD-Mon-YY')                       AS period_date,
+    
+        COALESCE(NULLIF(TRIM(g.dramount), '')::NUMERIC, 0)                AS dr,
+        COALESCE(NULLIF(TRIM(g.cramount), '')::NUMERIC, 0)                AS cr
+    
       FROM "GLImpact_table" g
-      WHERE LOWER(TRIM(g.isposting)) IN (${placeholders})
-        AND g.accounttext IS NOT NULL
-        AND TRIM(g.accounttext) <> ''
-        AND LOWER(TRIM(g.recordtype)) NOT IN ('currency revaluation', 'delivery note')
-        AND g.accounttype IN (
-          'Income','Other Income',
-          'Cost of Goods Sold',
-          'Expense','Other Expense'
-        )
+    
+      WHERE g.Accounttext IS NOT NULL
+        AND TRIM(g.Accounttext) <> ''
         ${subClause}
-      GROUP BY g.internalid, g.accounttext, g.accounttype
+    
+        AND TRIM(g.accounttype) IN (
+          'Income',
+          'COGS',
+          'Expense',
+          'OthIncome',
+          'OthExpense'
+        )
+    
+        AND LOWER(TRIM(g.Recordtype)) NOT IN (
+          'purchase order',
+          'sales order',
+          'estimate',
+          'opportunity',
+          'requisition',
+          'transfer order'
+        )
+    
+        AND g.trandate IS NOT NULL
     ),
-    pl_data AS (
+    
+    current_data AS (
+      SELECT b.*
+      FROM base_data b
+      CROSS JOIN date_range d
+      WHERE b.period_date BETWEEN d.start_date AND d.end_date
+    ),
+    
+    transaction_level AS (
       SELECT
-        internalid, recordtype, category, account, account_type,
-        CASE
-          WHEN category = 'Income' THEN cr - dr
-          WHEN category = 'COGS' THEN dr - cr
-          WHEN category = 'Expenses' THEN dr - cr
-        END AS amount
-      FROM detail_data
+        account,
+        accounttype,
+        Recordtype,
+        entitytext,
+        transaction_id,
+        MIN(trandate)   AS trandate,
+        SUM(dr)         AS dr,
+        SUM(cr)         AS cr
+      FROM current_data
+      GROUP BY
+        account,
+        accounttype,
+        Recordtype,
+        entitytext,
+        transaction_id
     ),
-    final AS (
-      SELECT internalid, recordtype, category, account, account_type, amount, 1 AS sort_order
-      FROM pl_data
-      UNION ALL
-      SELECT NULL, NULL, category, 'Total ' || category, NULL, ABS(SUM(amount)), 2
-      FROM pl_data
-      GROUP BY category
-      UNION ALL
-      SELECT NULL, NULL, 'Net', 'Net Income', NULL, SUM(amount), 3
-      FROM pl_data
+    
+    detail_data AS (
+      SELECT
+        t.account,
+    
+        CASE
+          WHEN TRIM(t.accounttype) = 'Income'     THEN '1 - Sales'
+          WHEN TRIM(t.accounttype) = 'COGS'       THEN '2 - Cost of Sales'
+          WHEN TRIM(t.accounttype) = 'Expense'    THEN '3 - Overheads'
+          WHEN TRIM(t.accounttype) = 'OthIncome'  THEN '4 - Other Income'
+          WHEN TRIM(t.accounttype) = 'OthExpense' THEN '5 - Other Expenses'
+        END                                                                AS account_section,
+    
+        t.Recordtype,
+        t.entitytext,
+        t.transaction_id,
+        t.trandate,
+    
+        /* NET AMOUNT per transaction
+           Income / OthIncome  : CR - DR  (credit = positive income)
+           COGS / Expense / OthExpense : DR - CR  (debit = positive cost)
+           Matches NetSuite Amount column exactly                         */
+        CASE
+          WHEN TRIM(t.accounttype) IN ('Income', 'OthIncome')
+          THEN t.cr - t.dr
+          ELSE t.dr - t.cr
+        END                                                                AS amount
+    
+      FROM transaction_level t
     )
-    SELECT internalid, recordtype, category, account, account_type, amount
-    FROM final
+    
+    SELECT
+      account,
+      account_section,
+      Recordtype,
+      entitytext,
+      transaction_id,
+      trandate,
+      amount
+    FROM detail_data
+    
+    WHERE amount <> 0
+    
     ORDER BY
-      CASE category
-        WHEN 'Income' THEN 1
-        WHEN 'COGS' THEN 2
-        WHEN 'Expenses' THEN 3
-        WHEN 'Net' THEN 4
-      END,
-      sort_order,
-      account
+      account_section,
+      account,
+      trandate NULLS FIRST,
+      transaction_id
   `;
 
-  const bindings = subFilter ? [...periods, ...subFilter.bindings] : periods;
+  const bindings = subFilter ? [fromPeriod, toPeriod, ...subFilter.bindings] : [fromPeriod, toPeriod];
   const result = await db.raw(sql, bindings);
   return result.rows;
 }
