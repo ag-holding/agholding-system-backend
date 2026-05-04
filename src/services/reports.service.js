@@ -1019,6 +1019,167 @@ async function getARAging({ fromPeriod, toPeriod, subsidiaries = [] }) {
   return result.rows;
 }
 
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. SALES BY TAXCODE
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function getSalesByTaxcode({ fromPeriod, toPeriod, subsidiaries = [] }) {
+  // Build period WHERE fragment (optional)
+  let periodClause = '';
+  let bindings = [];
+
+  if (fromPeriod && toPeriod) {
+    const periods = buildPeriodRange(fromPeriod, toPeriod);
+    if (periods.length === 0) {
+      throw Object.assign(new Error('Invalid period range'), { statusCode: 400 });
+    }
+    const placeholders = periods.map(() => '?').join(',');
+    periodClause = `AND LOWER(TRIM(st.period)) IN (${placeholders})`;
+    bindings = [...periods];
+  }
+
+  // Subsidiary filter (tax tables use 'subsidiary' column)
+  let subClause = '';
+  if (subsidiaries && subsidiaries.length > 0) {
+    const normalized = subsidiaries.map(s => s.trim().toLowerCase());
+    const subPlaceholders = normalized.map(() => '?').join(',');
+    subClause = `AND LOWER(TRIM(st.subsidiary)) IN (${subPlaceholders})`;
+    bindings = [...bindings, ...normalized];
+  }
+
+  const sql = `
+    SELECT
+      st.tax_item,
+      st.transaction_number,
+      st.document_number,
+      st.business_line,
+      st.transaction_type,
+      st.item_type,
+      st.name,
+ 
+      /* Net Amount (Foreign Currency) */
+      CASE
+        WHEN TRIM(st.amount_foreign_currency) LIKE '(%)'
+        THEN -REPLACE(REPLACE(REGEXP_REPLACE(TRIM(st.amount_foreign_currency), '[^0-9.-]', '', 'g'), '(', ''), ')', '')::NUMERIC
+        ELSE COALESCE(REGEXP_REPLACE(TRIM(st.amount_foreign_currency), '[^0-9.-]', '', 'g')::NUMERIC, 0)
+      END AS netamount,
+ 
+      /* Tax Amount */
+      CASE
+        WHEN TRIM(st.tax_amount) LIKE '(%)'
+        THEN -REPLACE(REPLACE(REGEXP_REPLACE(TRIM(st.tax_amount), '[^0-9.-]', '', 'g'), '(', ''), ')', '')::NUMERIC
+        ELSE COALESCE(REGEXP_REPLACE(TRIM(st.tax_amount), '[^0-9.-]', '', 'g')::NUMERIC, 0)
+      END AS tax_amount,
+ 
+      /* Gross Amount */
+      CASE
+        WHEN TRIM(st.gross_amount) LIKE '(%)'
+        THEN -REPLACE(REPLACE(REGEXP_REPLACE(TRIM(st.gross_amount), '[^0-9.-]', '', 'g'), '(', ''), ')', '')::NUMERIC
+        ELSE COALESCE(REGEXP_REPLACE(TRIM(st.gross_amount), '[^0-9.-]', '', 'g')::NUMERIC, 0)
+      END AS gross_amount,
+ 
+      st.memo
+ 
+    FROM "so_tax_report" st
+ 
+    WHERE
+      /* Exclude NULL or empty tax_item */
+      COALESCE(NULLIF(TRIM(st.tax_item), ''), '') <> ''
+      /* Exclude zero amounts */
+      AND REGEXP_REPLACE(TRIM(st.amount_foreign_currency), '[^0-9.-]', '', 'g')::NUMERIC <> 0
+      ${periodClause}
+      ${subClause}
+ 
+    ORDER BY
+      st.tax_item,
+      st.transaction_number
+  `;
+
+  const result = await db.raw(sql, bindings);
+  return result.rows;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. PURCHASE BY TAXCODE
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function getPurchaseByTaxcode({ fromPeriod, toPeriod, subsidiaries = [] }) {
+  // Build period WHERE fragment (optional)
+  let periodClause = '';
+  let bindings = [];
+
+  if (fromPeriod && toPeriod) {
+    const periods = buildPeriodRange(fromPeriod, toPeriod);
+    if (periods.length === 0) {
+      throw Object.assign(new Error('Invalid period range'), { statusCode: 400 });
+    }
+    const placeholders = periods.map(() => '?').join(',');
+    periodClause = `AND LOWER(TRIM(pt.period)) IN (${placeholders})`;
+    bindings = [...periods];
+  }
+
+  // Subsidiary filter (tax tables use 'subsidiary' column)
+  let subClause = '';
+  if (subsidiaries && subsidiaries.length > 0) {
+    const normalized = subsidiaries.map(s => s.trim().toLowerCase());
+    const subPlaceholders = normalized.map(() => '?').join(',');
+    subClause = `AND LOWER(TRIM(pt.subsidiary)) IN (${subPlaceholders})`;
+    bindings = [...bindings, ...normalized];
+  }
+
+  const sql = `
+    SELECT
+      pt.tax_item,
+      pt.transaction_number,
+      pt.document_number,
+      pt.transaction_type,
+      pt.name,
+ 
+      /* Net Amount (Foreign Currency) */
+      CASE
+        WHEN TRIM(pt.amount_foreign_currency) LIKE '(%)'
+        THEN -REPLACE(REPLACE(REGEXP_REPLACE(TRIM(pt.amount_foreign_currency), '[^0-9.-]', '', 'g'), '(', ''), ')', '')::NUMERIC
+        ELSE COALESCE(REGEXP_REPLACE(TRIM(pt.amount_foreign_currency), '[^0-9.-]', '', 'g')::NUMERIC, 0)
+      END AS netamount,
+ 
+      /* Tax Amount */
+      CASE
+        WHEN TRIM(pt.tax_amount) LIKE '(%)'
+        THEN -REPLACE(REPLACE(REGEXP_REPLACE(TRIM(pt.tax_amount), '[^0-9.-]', '', 'g'), '(', ''), ')', '')::NUMERIC
+        ELSE COALESCE(REGEXP_REPLACE(TRIM(pt.tax_amount), '[^0-9.-]', '', 'g')::NUMERIC, 0)
+      END AS tax_amount,
+ 
+      /* Gross Amount */
+      CASE
+        WHEN TRIM(pt.gross_amount) LIKE '(%)'
+        THEN -REPLACE(REPLACE(REGEXP_REPLACE(TRIM(pt.gross_amount), '[^0-9.-]', '', 'g'), '(', ''), ')', '')::NUMERIC
+        ELSE COALESCE(REGEXP_REPLACE(TRIM(pt.gross_amount), '[^0-9.-]', '', 'g')::NUMERIC, 0)
+      END AS gross_amount,
+ 
+      pt.memo
+ 
+    FROM "po_tax_report" pt
+ 
+    WHERE 
+      /* Exclude NULL / blank tax code */
+      COALESCE(NULLIF(TRIM(pt.tax_item), ''), '') <> ''
+      /* Exclude zero amount */
+      AND REGEXP_REPLACE(TRIM(pt.amount_foreign_currency), '[^0-9.-]', '', 'g')::NUMERIC <> 0
+      ${periodClause}
+      ${subClause}
+ 
+    ORDER BY
+      pt.tax_item,
+      pt.transaction_number
+  `;
+
+  const result = await db.raw(sql, bindings);
+  return result.rows;
+}
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 module.exports = {
@@ -1031,6 +1192,8 @@ module.exports = {
   getVatReport,
   getAPAging,
   getARAging,
+  getSalesByTaxcode,
+  getPurchaseByTaxcode,
   buildPeriodRange,
   sortPeriods,
 };

@@ -8,6 +8,8 @@ const {
   getVatReport,
   getAPAging,
   getARAging,
+  getSalesByTaxcode,
+  getPurchaseByTaxcode,
 } = require('../services/reports.service');
 
 const logger = require('../utils/logger');
@@ -150,6 +152,44 @@ exports.arAging = async (req, res, next) => {
     }
     const rows = await getARAging({ fromPeriod, toPeriod, subsidiaries });
     res.json({ success: true, report: 'ar-aging', fromPeriod, toPeriod, rowCount: rows.length, data: rows });
+  } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ success: false, error: err.message });
+    next(err);
+  }
+};
+
+// ─── GET /api/reports/sales-by-taxcode ───────────────────────────────────────
+exports.salesByTaxcode = async (req, res, next) => {
+  try {
+    const { fromPeriod, toPeriod, subsidiaries } = extractFilters(req);
+    const rows = await getSalesByTaxcode({ fromPeriod, toPeriod, subsidiaries });
+    res.json({
+      success: true,
+      report: 'sales-by-taxcode',
+      fromPeriod: fromPeriod || null,
+      toPeriod: toPeriod || null,
+      rowCount: rows.length,
+      data: rows,
+    });
+  } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ success: false, error: err.message });
+    next(err);
+  }
+};
+
+// ─── GET /api/reports/purchase-by-taxcode ────────────────────────────────────
+exports.purchaseByTaxcode = async (req, res, next) => {
+  try {
+    const { fromPeriod, toPeriod, subsidiaries } = extractFilters(req);
+    const rows = await getPurchaseByTaxcode({ fromPeriod, toPeriod, subsidiaries });
+    res.json({
+      success: true,
+      report: 'purchase-by-taxcode',
+      fromPeriod: fromPeriod || null,
+      toPeriod: toPeriod || null,
+      rowCount: rows.length,
+      data: rows,
+    });
   } catch (err) {
     if (err.statusCode) return res.status(err.statusCode).json({ success: false, error: err.message });
     next(err);

@@ -30,6 +30,7 @@ const REPORT_VIRTUAL_MODULES = [
   'report_vat_report',
   'report_ap_aging',
   'report_ar_aging',
+  'report_sales_by_taxcode',
 ];
 
 // ─── Subsidiaries ────────────────────────────────────────────────────────────

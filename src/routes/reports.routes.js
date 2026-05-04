@@ -67,4 +67,16 @@ router.get(
   ctrl.arAging
 );
 
+router.get(
+  '/sales-by-taxcode',
+  ...auth, requireModuleAccess('report_sales_by_taxcode'),
+  ctrl.salesByTaxcode
+);
+
+router.get(
+  '/purchase-by-taxcode',
+  ...auth, requireModuleAccess('report_purchase_by_taxcode'),
+  ctrl.purchaseByTaxcode
+);
+
 module.exports = router;
