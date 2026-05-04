@@ -804,124 +804,93 @@ async function getVatReport({ fromPeriod, toPeriod, subsidiaries = [] }) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function getAPAging({ fromPeriod, toPeriod, subsidiaries = [] }) {
-  const periods = buildTransactionPeriods(fromPeriod, toPeriod);
-  if (periods.length === 0) throw Object.assign(new Error('Invalid period range'), { statusCode: 400 });
+  if (!fromPeriod || !toPeriod) throw Object.assign(new Error('Invalid period range'), { statusCode: 400 });
 
-  const placeholders = periods.map(() => '?').join(',');
-
-  // Transaction tables use "subsidiary" column, not "glsubsidiarytext"
+  // Build subsidiary filter if needed
   let subClause = '';
   let subBindings = [];
   if (subsidiaries && subsidiaries.length > 0) {
     const normalized = subsidiaries.map(s => s.trim().toLowerCase());
     const subPlaceholders = normalized.map(() => '?').join(',');
-    subClause = `AND LOWER(TRIM(subsidiary)) IN (${subPlaceholders})`;
+    subClause = `AND LOWER(TRIM(ap.subsidiary)) IN (${subPlaceholders})`;
     subBindings = normalized;
   }
 
-  // Each source table needs its own copy of period + subsidiary bindings
-  const singleBindings = [...periods, ...subBindings];
-  const bindings = [
-    ...singleBindings, // vendorbill
-    ...singleBindings, // vendorcredit
-    ...singleBindings, // vendorpayment
-    ...singleBindings, // deposit
-  ];
+  const bindings = [fromPeriod, toPeriod, ...subBindings];
 
   const sql = `
-    WITH trx AS (
-      -- Bill (positive balance)
-      SELECT
-        b.internalid,
-        'Bill' AS recordtype,
-        b.tranid,
-        b.trandate,
-        b.duedate,
-        COALESCE(NULLIF(TRIM(b.name), ''), 'No Vendor') AS vendor_name,
-        COALESCE(NULLIF(TRIM(b.total), '')::numeric, 0) AS open_balance
-      FROM vendorbill b
-      WHERE LOWER(TRIM(b."postingperiod")) IN (${placeholders})
-        ${subClause}
-
-      UNION ALL
-
-      -- Vendor Credit (negative balance)
-      SELECT
-        bc.internalid,
-        'Vendor Credit' AS recordtype,
-        bc.tranid,
-        bc.trandate,
-        bc.trandate AS duedate,
-        COALESCE(NULLIF(TRIM(bc.name), ''), 'No Vendor') AS vendor_name,
-        -COALESCE(NULLIF(TRIM(bc.total), '')::numeric, 0) AS open_balance
-      FROM vendorcredit bc
-      WHERE LOWER(TRIM(bc."postingperiod")) IN (${placeholders})
-        ${subClause}
-
-      UNION ALL
-
-      -- Vendor Payment (negative balance)
-      SELECT
-        vp.internalid,
-        'Vendor Payment' AS recordtype,
-        vp.tranid,
-        vp.trandate,
-        vp.trandate AS duedate,
-        COALESCE(NULLIF(TRIM(vp.name), ''), 'No Vendor') AS vendor_name,
-        -COALESCE(NULLIF(TRIM(vp.total), '')::numeric, 0) AS open_balance
-      FROM vendorpayment vp
-      WHERE LOWER(TRIM(vp."postingperiod")) IN (${placeholders})
-        ${subClause}
-
-      UNION ALL
-
-      -- Deposit (negative balance)
-      SELECT
-        d.internalid,
-        'Deposit' AS recordtype,
-        d.tranid,
-        d.trandate,
-        d.trandate AS duedate,
-        COALESCE(NULLIF(TRIM(d.name), ''), 'No Vendor') AS vendor_name,
-        -COALESCE(NULLIF(TRIM(d.total), '')::numeric, 0) AS open_balance
-      FROM deposit d
-      WHERE LOWER(TRIM(d."postingperiod")) IN (${placeholders})
-        ${subClause}
+    WITH params AS (
+      SELECT 
+        ? AS from_period,
+        ? AS to_period
     ),
-
-    filtered AS (
-      SELECT * FROM trx
-      WHERE ABS(open_balance) > 0.01
+    
+    date_range AS (
+      SELECT
+        TO_DATE('01-' || from_period, 'DD-Mon-YY') AS start_date,
+        (TO_DATE('01-' || to_period, 'DD-Mon-YY') 
+          + INTERVAL '1 month' - INTERVAL '1 day') AS end_date
+      FROM params
     ),
-
-    aged AS (
+    
+    base AS (
+      SELECT
+        ap.name                                              AS vendor_name,
+        ap.type                                              AS record_type,
+        ap.document_number,
+        TO_DATE(TRIM(ap.transaction_date), 'DD-MM-YYYY')     AS bill_date,
+        TO_DATE(TRIM(ap.due_date), 'DD-MM-YYYY')             AS due_date,
+        ap.period,
+        ap.currency,
+        ap.status,
+ 
+        /* Open Balance (Foreign Currency like NetSuite Aging) */
+        COALESCE(NULLIF(TRIM(ap.amount_remaining_foreign), '')::NUMERIC, 0) 
+                                                             AS open_balance,
+ 
+        /* Age Calculation */
+        CASE
+          WHEN NULLIF(TRIM(ap.due_date), '') IS NULL THEN 0
+          ELSE (
+            CURRENT_DATE 
+            - TO_DATE(TRIM(ap.due_date), 'DD-MM-YYYY')
+          )::INT
+        END                                                  AS age
+ 
+      FROM "_aging_a_p_data" ap
+      CROSS JOIN date_range d
+      WHERE TO_DATE(TRIM(ap.transaction_date), 'DD-MM-YYYY') BETWEEN d.start_date AND d.end_date
+        ${subClause}
+        AND COALESCE(NULLIF(TRIM(ap.amount_remaining_foreign), '')::NUMERIC, 0) > 0.01
+    ),
+ 
+    final AS (
       SELECT
         *,
-        CURRENT_DATE - COALESCE(
-          TO_DATE(NULLIF(TRIM(duedate), ''), 'DD/MM/YYYY'),
-          CURRENT_DATE
-        ) AS age,
         CASE
-          WHEN CURRENT_DATE - COALESCE(TO_DATE(NULLIF(TRIM(duedate), ''), 'DD/MM/YYYY'), CURRENT_DATE) <= 30 THEN '0-30'
-          WHEN CURRENT_DATE - COALESCE(TO_DATE(NULLIF(TRIM(duedate), ''), 'DD/MM/YYYY'), CURRENT_DATE) <= 60 THEN '31-60'
-          WHEN CURRENT_DATE - COALESCE(TO_DATE(NULLIF(TRIM(duedate), ''), 'DD/MM/YYYY'), CURRENT_DATE) <= 90 THEN '61-90'
+          WHEN age <= 0 THEN 'Current'
+          WHEN age <= 30 THEN '1-30'
+          WHEN age <= 60 THEN '31-60'
+          WHEN age <= 90 THEN '61-90'
           ELSE '90+'
         END AS aging_bucket
-      FROM filtered
+      FROM base
     )
-
+ 
     SELECT
       vendor_name,
-      internalid,
-      recordtype,
-      trandate,
-      tranid,
-      duedate,
+      record_type,
+      document_number,
+      bill_date,
+      due_date,
+      period,
+      currency,
+      status,
       open_balance,
       age,
       aging_bucket
-    FROM aged
-    ORDER BY vendor_name, trandate
+    FROM final
+    ORDER BY vendor_name, bill_date
   `;
 
   const result = await db.raw(sql, bindings);
@@ -953,140 +922,97 @@ function buildTransactionPeriods(fromPeriod, toPeriod) {
 }
 
 async function getARAging({ fromPeriod, toPeriod, subsidiaries = [] }) {
-  const periods = buildTransactionPeriods(fromPeriod, toPeriod);
-  if (periods.length === 0) throw Object.assign(new Error('Invalid period range'), { statusCode: 400 });
+  if (!fromPeriod || !toPeriod) throw Object.assign(new Error('Invalid period range'), { statusCode: 400 });
 
-  const placeholders = periods.map(() => '?').join(',');
-
-  // Transaction tables use "subsidiary" column, not "glsubsidiarytext"
+  // Build subsidiary filter if needed
   let subClause = '';
   let subBindings = [];
   if (subsidiaries && subsidiaries.length > 0) {
     const normalized = subsidiaries.map(s => s.trim().toLowerCase());
     const subPlaceholders = normalized.map(() => '?').join(',');
-    subClause = `AND LOWER(TRIM(subsidiary)) IN (${subPlaceholders})`;
+    subClause = `AND LOWER(TRIM(ar.subsidiary)) IN (${subPlaceholders})`;
     subBindings = normalized;
   }
 
-  // Each source table needs its own copy of period + subsidiary bindings
-  const singleBindings = [...periods, ...subBindings];
-  const bindings = [
-    ...singleBindings, // invoice
-    ...singleBindings, // creditmemo
-    ...singleBindings, // customerpayment
-    ...singleBindings, // check
-    ...singleBindings, // deposit
-  ];
+  const bindings = [fromPeriod, toPeriod, ...subBindings];
 
   const sql = `
-    WITH trx AS (
-      -- Invoice (positive balance)
-      SELECT
-        i.internalid,
-        'Invoice' AS recordtype,
-        i.tranid,
-        i.trandate,
-        i.duedate,
-        COALESCE(NULLIF(TRIM(i.name), ''), 'No Customer/Project') AS customer_name,
-        COALESCE(NULLIF(TRIM(i.total), '')::numeric, 0) AS open_balance
-      FROM invoice i
-      WHERE LOWER(TRIM(i."postingperiod")) IN (${placeholders})
-        ${subClause}
-
-      UNION ALL
-
-      -- Credit Memo (negative balance)
-      SELECT
-        cm.internalid,
-        'Credit Memo' AS recordtype,
-        cm.tranid,
-        cm.trandate,
-        cm.trandate AS duedate,
-        COALESCE(NULLIF(TRIM(cm.name), ''), 'No Customer/Project') AS customer_name,
-        -COALESCE(NULLIF(TRIM(cm.total), '')::numeric, 0) AS open_balance
-      FROM creditmemo cm
-      WHERE LOWER(TRIM(cm."postingperiod")) IN (${placeholders})
-        ${subClause}
-
-      UNION ALL
-
-      -- Customer Payment (negative balance)
-      SELECT
-        cp.internalid,
-        'Payment' AS recordtype,
-        cp.tranid,
-        cp.trandate,
-        cp.trandate AS duedate,
-        COALESCE(NULLIF(TRIM(cp.name), ''), 'No Customer/Project') AS customer_name,
-        -COALESCE(NULLIF(TRIM(cp.total), '')::numeric, 0) AS open_balance
-      FROM customerpayment cp
-      WHERE LOWER(TRIM(cp."postingperiod")) IN (${placeholders})
-        ${subClause}
-
-      UNION ALL
-
-      -- Check (negative balance)
-      SELECT
-        ch.internalid,
-        'Check' AS recordtype,
-        ch.tranid,
-        ch.trandate,
-        ch.trandate AS duedate,
-        COALESCE(NULLIF(TRIM(ch.name), ''), 'No Customer/Project') AS customer_name,
-        -COALESCE(NULLIF(TRIM(ch.total), '')::numeric, 0) AS open_balance
-      FROM "check" ch
-      WHERE LOWER(TRIM(ch."postingperiod")) IN (${placeholders})
-        ${subClause}
-
-      UNION ALL
-
-      -- Deposit (negative balance)
-      SELECT
-        d.internalid,
-        'Deposit' AS recordtype,
-        d.tranid,
-        d.trandate,
-        d.trandate AS duedate,
-        COALESCE(NULLIF(TRIM(d.name), ''), 'No Customer/Project') AS customer_name,
-        -COALESCE(NULLIF(TRIM(d.total), '')::numeric, 0) AS open_balance
-      FROM deposit d
-      WHERE LOWER(TRIM(d."postingperiod")) IN (${placeholders})
-        ${subClause}
+    WITH params AS (
+      SELECT 
+        ? AS from_period,
+        ? AS to_period
     ),
-
-    filtered AS (
-      SELECT * FROM trx
-      WHERE ABS(open_balance) > 0.01
+    
+    date_range AS (
+      SELECT
+        TO_DATE('01-' || from_period, 'DD-Mon-YY') AS start_date,
+        (TO_DATE('01-' || to_period, 'DD-Mon-YY') 
+          + INTERVAL '1 month' - INTERVAL '1 day') AS end_date
+      FROM params
     ),
-
-    aged AS (
+    
+    base AS (
+      SELECT
+        ar.name                                              AS customer_name,
+        ar.type                                              AS record_type,
+        ar.document_number,
+        TO_DATE(TRIM(ar.transaction_date), 'DD-MM-YYYY')     AS invoice_date,
+        TO_DATE(TRIM(ar.due_date), 'DD-MM-YYYY')             AS due_date,
+        ar.period,
+        ar.currency,
+        ar.status,
+ 
+        /* Open Balance (Foreign Currency - NetSuite Standard)
+           Handles parentheses notation for negative values */
+        CASE
+          WHEN TRIM(ar.amount_remaining_foreign) LIKE '(%)'
+          THEN -REPLACE(REPLACE(TRIM(ar.amount_remaining_foreign), '(', ''), ')', '')::NUMERIC
+          ELSE COALESCE(NULLIF(TRIM(ar.amount_remaining_foreign), '')::NUMERIC, 0)
+        END                                                   AS open_balance,
+ 
+        /* Age Calculation */
+        CASE
+          WHEN NULLIF(TRIM(ar.due_date), '') IS NULL THEN 0
+          ELSE (
+            CURRENT_DATE
+            - TO_DATE(TRIM(ar.due_date), 'DD-MM-YYYY')
+          )::INT
+        END                                                   AS age
+ 
+      FROM "aging_r_a_data" ar
+      CROSS JOIN date_range d
+      WHERE TO_DATE(TRIM(ar.transaction_date), 'DD-MM-YYYY') BETWEEN d.start_date AND d.end_date
+        ${subClause}
+        AND REPLACE(REPLACE(TRIM(ar.amount_remaining_foreign), '(', '-'), ')', '')::NUMERIC <> 0
+    ),
+ 
+    final AS (
       SELECT
         *,
-        CURRENT_DATE - COALESCE(
-          TO_DATE(NULLIF(TRIM(duedate), ''), 'DD/MM/YYYY'),
-          CURRENT_DATE
-        ) AS age,
         CASE
-          WHEN CURRENT_DATE - COALESCE(TO_DATE(NULLIF(TRIM(duedate), ''), 'DD/MM/YYYY'), CURRENT_DATE) <= 30 THEN '0-30'
-          WHEN CURRENT_DATE - COALESCE(TO_DATE(NULLIF(TRIM(duedate), ''), 'DD/MM/YYYY'), CURRENT_DATE) <= 60 THEN '31-60'
-          WHEN CURRENT_DATE - COALESCE(TO_DATE(NULLIF(TRIM(duedate), ''), 'DD/MM/YYYY'), CURRENT_DATE) <= 90 THEN '61-90'
+          WHEN age <= 0 THEN 'Current'
+          WHEN age <= 30 THEN '1-30'
+          WHEN age <= 60 THEN '31-60'
+          WHEN age <= 90 THEN '61-90'
           ELSE '90+'
         END AS aging_bucket
-      FROM filtered
+      FROM base
     )
-
+ 
     SELECT
-      internalid,
       customer_name,
-      recordtype,
-      trandate,
-      tranid,
-      duedate,
+      record_type,
+      document_number,
+      invoice_date,
+      due_date,
+      period,
+      currency,
+      status,
       open_balance,
       age,
       aging_bucket
-    FROM aged
-    ORDER BY customer_name, trandate
+    FROM final
+    ORDER BY customer_name, invoice_date
   `;
 
   const result = await db.raw(sql, bindings);
